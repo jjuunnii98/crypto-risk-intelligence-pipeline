@@ -1,0 +1,29 @@
+# Core data processing
+pandas
+numpy
+
+# Machine learning
+scikit-learn
+
+# API
+fastapi
+uvicorn
+pydantic
+
+# Data ingestion (API)
+requests
+
+# Config
+pyyaml
+
+# Visualization / EDA
+matplotlib
+seaborn
+
+# Testing
+pytest
+
+# Optional for future expansion
+# xgboost
+# statsmodels
+# ta
