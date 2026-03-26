@@ -1,0 +1,78 @@
+project:
+  name: "crypto-risk-intelligence-pipeline"
+  timezone: "Asia/Seoul"
+
+assets:
+  target_markets:
+    - "KRW-BTC"
+    - "KRW-ETH"
+    - "KRW-SOL"
+
+collection:
+  market:
+    interval_minutes: 1
+    lookback_candles: 120
+    request_timeout_seconds: 10
+    pause_seconds_between_requests: 0.15
+
+  news:
+    interval_minutes: 15
+    keywords:
+      - "비트코인"
+      - "이더리움"
+      - "솔라나"
+      - "업비트"
+      - "암호화폐 규제"
+      - "가상자산 해킹"
+
+risk:
+  rolling_window_minutes: 60
+  alert_evaluation_minutes: 5
+
+  thresholds:
+    volatility_risk:
+      caution: 0.50
+      warning: 0.70
+      critical: 0.85
+
+    liquidity_risk:
+      caution: 0.50
+      warning: 0.70
+      critical: 0.85
+
+    sentiment_risk:
+      caution: 0.50
+      warning: 0.70
+      critical: 0.85
+
+    event_risk:
+      caution: 0.50
+      warning: 0.70
+      critical: 0.85
+
+    total_risk:
+      caution: 0.55
+      warning: 0.75
+      critical: 0.90
+
+api:
+  upbit:
+    base_url: "https://api.upbit.com/v1"
+
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  events_dir: "data/events"
+
+alerts:
+  telegram:
+    enabled: false
+    bot_token_env: "TELEGRAM_BOT_TOKEN"
+    chat_id_env: "TELEGRAM_CHAT_ID"
+
+  gmail:
+    enabled: false
+    sender_env: "GMAIL_SENDER"
+    app_password_env: "GMAIL_APP_PASSWORD"
+    recipients:
+      - "jjuunnii98@yonsei.ac.kr"
