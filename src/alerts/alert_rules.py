@@ -1,4 +1,3 @@
-    
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +14,8 @@ RISK_COMPONENT_KEYS = [
 ]
 
 RISK_LEVEL_ORDER = ["normal", "caution", "warning", "critical"]
+WARNING_LIKE_LEVELS = {"warning", "critical"}
+CAUTION_LIKE_LEVELS = {"caution", "warning", "critical"}
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class AlertEvaluationResult:
     triggered_components: list[str]
     trigger_reasons: list[str]
     component_scores: dict[str, float]
+    component_levels: dict[str, str]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -52,6 +54,7 @@ class AlertEvaluationResult:
             "triggered_components": self.triggered_components,
             "trigger_reasons": self.trigger_reasons,
             "component_scores": self.component_scores,
+            "component_levels": self.component_levels,
         }
 
 
@@ -149,12 +152,6 @@ class AlertRuleEngine:
             return "caution"
         return "normal"
 
-    @staticmethod
-    def _max_level(levels: list[str]) -> str:
-        if not levels:
-            return "normal"
-        return max(levels, key=RISK_LEVEL_ORDER.index)
-
     def _get_component_threshold(self, component_name: str) -> ThresholdLevel:
         try:
             return getattr(self.thresholds, component_name)
@@ -164,23 +161,66 @@ class AlertRuleEngine:
     def _evaluate_component_levels(
         self,
         component_scores: dict[str, float],
-    ) -> tuple[list[str], list[str], list[str]]:
-        component_levels: list[str] = []
+    ) -> tuple[dict[str, str], list[str], list[str]]:
+        component_levels: dict[str, str] = {}
         triggered_components: list[str] = []
         trigger_reasons: list[str] = []
 
         for component_name, score in component_scores.items():
             threshold = self._get_component_threshold(component_name)
             level = self._resolve_level(score, threshold)
-            component_levels.append(level)
+            component_levels[component_name] = level
 
             if level != "normal":
                 triggered_components.append(component_name)
-                trigger_reasons.append(
-                    f"{component_name}={score:.2f} ({level})"
-                )
+                trigger_reasons.append(f"{component_name}={score:.2f} ({level})")
 
         return component_levels, triggered_components, trigger_reasons
+
+    def _resolve_combined_level(
+        self,
+        total_level: str,
+        component_levels: dict[str, str],
+    ) -> str:
+        """
+        Resolve the final risk level using both total risk and component risk.
+
+        Policy
+        ------
+        - total_risk_score is the primary signal.
+        - component risk can escalate the final level, but only with moderation.
+        - a single critical component does not automatically force final critical unless
+          the total level is already elevated.
+        """
+        levels = list(component_levels.values())
+
+        warning_like_count = sum(level in WARNING_LIKE_LEVELS for level in levels)
+        caution_like_count = sum(level in CAUTION_LIKE_LEVELS for level in levels)
+        has_critical_component = any(level == "critical" for level in levels)
+        has_warning_component = any(level in WARNING_LIKE_LEVELS for level in levels)
+        has_caution_component = any(level in CAUTION_LIKE_LEVELS for level in levels)
+
+        if total_level == "critical":
+            return "critical"
+
+        if total_level == "warning":
+            if has_critical_component or warning_like_count >= 2:
+                return "critical"
+            return "warning"
+
+        if total_level == "caution":
+            if has_critical_component or warning_like_count >= 2:
+                return "warning"
+            return "caution"
+
+        # total_level == "normal"
+        if warning_like_count >= 2:
+            return "warning"
+        if has_warning_component or caution_like_count >= 2:
+            return "caution"
+        if has_caution_component:
+            return "caution"
+        return "normal"
 
     def evaluate(self, risk_payload: dict[str, Any]) -> AlertEvaluationResult:
         if not isinstance(risk_payload, dict):
@@ -206,12 +246,12 @@ class AlertRuleEngine:
         )
 
         total_level = self._resolve_level(total_risk_score, self.thresholds.total_risk)
-        combined_level = self._max_level(component_levels + [total_level])
+        combined_level = self._resolve_combined_level(total_level, component_levels)
 
         if total_level != "normal":
             trigger_reasons.insert(0, f"total_risk_score={total_risk_score:.2f} ({total_level})")
 
-        should_alert = combined_level in {"warning", "critical"}
+        should_alert = combined_level in WARNING_LIKE_LEVELS
 
         return AlertEvaluationResult(
             asset=asset,
@@ -221,6 +261,7 @@ class AlertRuleEngine:
             triggered_components=triggered_components,
             trigger_reasons=trigger_reasons,
             component_scores=component_scores,
+            component_levels=component_levels,
         )
 
 
