@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import altair as alt
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from sqlalchemy import desc, select
 from streamlit import column_config
 
@@ -54,7 +55,7 @@ def load_dashboard_data() -> dict[str, Any]:
     Load dashboard data from SQLite first.
     Falls back to CSV files if DB tables are empty.
     """
-    risk_df, ticker_df, news_df, risk_history_df = _load_dashboard_data_from_db()
+    risk_df, ticker_df, news_df, risk_history_df, market_history_df = _load_dashboard_data_from_db()
 
     risk_source = "sqlite:risk_snapshots"
     ticker_source = "sqlite:market_snapshots"
@@ -80,13 +81,15 @@ def load_dashboard_data() -> dict[str, Any]:
         "news_source": news_source,
         "risk_history_df": risk_history_df,
         "risk_history_source": risk_history_source,
+        "market_history_df": market_history_df,
+        "market_history_source": "sqlite:market_snapshots(history)",
     }
 
 
 @st.cache_data(show_spinner=False)
-def _load_dashboard_data_from_db() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def _load_dashboard_data_from_db() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Load latest risk, market, news, and risk history data from SQLite.
+    Load latest risk, market, news, and both risk/market history data from SQLite.
     """
     db = SessionLocal()
     try:
@@ -94,11 +97,11 @@ def _load_dashboard_data_from_db() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataF
         ticker_df = _load_latest_market_from_db(db)
         news_df = _load_latest_news_from_db(db)
         risk_history_df = _load_risk_history_from_db(db)
+        market_history_df = _load_market_history_from_db(db)
     finally:
         db.close()
 
-    return risk_df, ticker_df, news_df, risk_history_df
-
+    return risk_df, ticker_df, news_df, risk_history_df, market_history_df
 
 
 def _rows_to_dataframe(rows: list[Any], columns: list[str] | None = None) -> pd.DataFrame:
@@ -117,7 +120,7 @@ def _rows_to_dataframe(rows: list[Any], columns: list[str] | None = None) -> pd.
     return pd.DataFrame(records)
 
 
-def _load_latest_risk_from_db(db) -> pd.DataFrame:
+def _load_latest_risk_from_db(db: Any) -> pd.DataFrame:
     """
     Load only the most recent risk snapshot timestamp from DB.
     """
@@ -137,7 +140,7 @@ def _load_latest_risk_from_db(db) -> pd.DataFrame:
     return _rows_to_dataframe(rows)
 
 
-def _load_risk_history_from_db(db, limit: int = 500) -> pd.DataFrame:
+def _load_risk_history_from_db(db: Any, limit: int = 500) -> pd.DataFrame:
     """
     Load recent historical risk snapshots from DB for time-series visualization.
     """
@@ -154,7 +157,7 @@ def _load_risk_history_from_db(db, limit: int = 500) -> pd.DataFrame:
     return history_df.sort_values(["created_at", "asset"]).reset_index(drop=True)
 
 
-def _load_latest_market_from_db(db) -> pd.DataFrame:
+def _load_latest_market_from_db(db: Any) -> pd.DataFrame:
     """
     Load the most recent market snapshot per asset from DB.
     """
@@ -174,7 +177,24 @@ def _load_latest_market_from_db(db) -> pd.DataFrame:
     return _rows_to_dataframe(rows)
 
 
-def _load_latest_news_from_db(db, limit: int = 50) -> pd.DataFrame:
+def _load_market_history_from_db(db: Any, limit: int = 1000) -> pd.DataFrame:
+    """
+    Load recent historical market snapshots from DB for price and market-change visualization.
+    """
+    rows = db.execute(
+        select(MarketSnapshot)
+        .order_by(desc(MarketSnapshot.collected_at), desc(MarketSnapshot.id))
+        .limit(limit)
+    ).scalars().all()
+
+    market_history_df = _rows_to_dataframe(rows)
+    if market_history_df.empty:
+        return market_history_df
+
+    return market_history_df.sort_values(["collected_at", "market"]).reset_index(drop=True)
+
+
+def _load_latest_news_from_db(db: Any, limit: int = 50) -> pd.DataFrame:
     """
     Load recent news rows from DB.
     """
@@ -276,6 +296,46 @@ def prepare_ticker_dataframe(ticker_df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def prepare_market_history_dataframe(market_history_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Prepare historical market dataframe for time-series charts.
+    """
+    if market_history_df.empty:
+        return market_history_df
+
+    df = market_history_df.copy()
+
+    if "collected_at" in df.columns:
+        df["collected_at"] = pd.to_datetime(df["collected_at"], errors="coerce", utc=True)
+
+    numeric_columns = [
+        "trade_price",
+        "signed_change_rate",
+        "total_ask_size",
+        "total_bid_size",
+        "ma_20",
+        "ma_60",
+        "rsi_14",
+        "bollinger_upper_20",
+        "bollinger_lower_20",
+    ]
+    for column in numeric_columns:
+        if column in df.columns:
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    if "market" in df.columns:
+        df["market"] = df["market"].astype(str)
+
+    if "trade_price" in df.columns:
+        df["price_change"] = df.groupby("market")["trade_price"].diff()
+
+    if "signed_change_rate" in df.columns:
+        df["signed_change_rate_pct"] = df["signed_change_rate"] * 100
+
+    return df.dropna(subset=["collected_at", "market"]).reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
 def prepare_news_dataframe(news_df: pd.DataFrame) -> pd.DataFrame:
     """
     Prepare news dataframe for dashboard display.
@@ -317,18 +377,46 @@ def _parse_trigger_reasons(value: Any) -> list[str]:
     return [text]
 
 
+def enable_auto_refresh(enabled: bool, interval_seconds: int) -> None:
+    """
+    Auto-refresh the Streamlit page using a lightweight browser reload script.
+    """
+    if not enabled:
+        return
+
+    interval_ms = max(interval_seconds, 5) * 1000
+    components.html(
+        f"""
+        <script>
+            setTimeout(function() {{
+                window.parent.location.reload();
+            }}, {interval_ms});
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def render_component_risk_chart(component_table: pd.DataFrame) -> None:
     """
-    Render component risk scores with horizontal x-axis labels.
+    Render component risk scores with horizontal x-axis labels and cleaner labels.
     """
+    label_map = {
+        "volatility_risk": "Volatility",
+        "liquidity_risk": "Liquidity",
+        "sentiment_risk": "Sentiment",
+        "event_risk": "Event",
+    }
+    chart_df = component_table.copy()
+    chart_df["component_label"] = chart_df["component"].map(label_map).fillna(chart_df["component"])
+
     chart = (
-        alt.Chart(component_table)
+        alt.Chart(chart_df)
         .mark_bar()
         .encode(
             x=alt.X(
-                "component:N",
+                "component_label:N",
                 title="Risk Component",
                 axis=alt.Axis(labelAngle=0),
             ),
@@ -338,7 +426,7 @@ def render_component_risk_chart(component_table: pd.DataFrame) -> None:
                 scale=alt.Scale(domain=[0, 1]),
             ),
             tooltip=[
-                alt.Tooltip("component:N", title="Component"),
+                alt.Tooltip("component_label:N", title="Component"),
                 alt.Tooltip("score:Q", title="Score", format=".4f"),
             ],
         )
@@ -353,6 +441,7 @@ def render_header(
     ticker_source: str | None,
     news_source: str | None,
     risk_history_source: str | None,
+    market_history_source: str | None,
 ) -> None:
     st.title("Crypto Risk Intelligence Dashboard")
     st.caption("Upbit market data + Google/Naver News based risk monitoring dashboard")
@@ -362,13 +451,14 @@ def render_header(
             {
                 "risk": risk_source,
                 "market": ticker_source,
+                "market_history": market_history_source,
                 "news": news_source,
                 "risk_history": risk_history_source,
             }
         )
 
 
-def render_kpis(risk_df: pd.DataFrame) -> None:
+def render_kpis(risk_df: pd.DataFrame, risk_history_df: pd.DataFrame) -> None:
     if risk_df.empty:
         st.warning("No risk evaluation data found. Run the realtime pipeline first.")
         return
@@ -386,11 +476,23 @@ def render_kpis(risk_df: pd.DataFrame) -> None:
         highest_asset = str(highest_row["asset"])
         highest_score = float(highest_row["total_risk_score"])
 
-    col1, col2, col3, col4 = st.columns(4)
+    last_updated = "-"
+    if "created_at" in risk_df.columns and not risk_df["created_at"].dropna().empty:
+        latest_ts = risk_df["created_at"].dropna().max()
+        if getattr(latest_ts, "tzinfo", None) is not None:
+            last_updated = latest_ts.tz_convert("Asia/Seoul").strftime("%Y-%m-%d %H:%M:%S KST")
+        else:
+            last_updated = latest_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    snapshot_count = int(len(risk_history_df)) if not risk_history_df.empty else 0
+
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     col1.metric("Tracked Assets", total_assets)
     col2.metric("Alert Count", alert_count)
     col3.metric("Average Total Risk", f"{avg_total_risk:.4f}")
     col4.metric("Highest Risk Asset", f"{highest_asset} ({highest_score:.4f})")
+    col5.metric("Snapshots Stored", snapshot_count)
+    col6.metric("Last Updated", last_updated)
 
 
 def render_alert_banner(risk_df: pd.DataFrame) -> None:
@@ -437,10 +539,268 @@ def render_total_risk_timeseries(risk_history_df: pd.DataFrame) -> None:
 
     st.altair_chart(chart, use_container_width=True)
 
+def _safe_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if df is None or df.empty or column not in df.columns:
+        return pd.Series(dtype=str)
+    return df[column]
+
+def render_market_price_timeseries(market_history_df: pd.DataFrame) -> None:
+    """
+    Render normalized multi-asset comparison chart.
+    """
+    st.subheader("Historical Asset Price Trend")
+    if market_history_df.empty or "trade_price" not in market_history_df.columns:
+        st.info("No historical market price data available yet.")
+        return
+
+    price_df = market_history_df.dropna(subset=["trade_price"]).copy()
+    if price_df.empty:
+        st.info("No valid market price observations available.")
+        return
+
+    normalized_df = price_df.sort_values(["market", "collected_at"]).copy()
+    normalized_df["base_price"] = normalized_df.groupby("market")["trade_price"].transform("first")
+    normalized_df = normalized_df.loc[normalized_df["base_price"] > 0].copy()
+    normalized_df["normalized_price_index"] = (
+        normalized_df["trade_price"] / normalized_df["base_price"]
+    ) * 100
+
+    chart = (
+        alt.Chart(normalized_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("collected_at:T", title="Timestamp"),
+            y=alt.Y("normalized_price_index:Q", title="Normalized Price Index (Base=100)"),
+            color=alt.Color("market:N", title="Asset"),
+            tooltip=[
+                alt.Tooltip("collected_at:T", title="Timestamp"),
+                alt.Tooltip("market:N", title="Asset"),
+                alt.Tooltip("trade_price:Q", title="Trade Price", format=",.0f"),
+                alt.Tooltip("normalized_price_index:Q", title="Normalized Index", format=".2f"),
+            ],
+        )
+        .properties(height=320)
+    )
+
+    st.caption("Normalized comparison view: each asset starts at 100 so relative movement can be compared across BTC, ETH, and SOL.")
+    st.altair_chart(chart, use_container_width=True)
+
+def render_actual_market_price_chart(
+    market_history_df: pd.DataFrame,
+    selected_market_view: str,
+    fallback_asset: str | None,
+) -> None:
+    """
+    Render an upbit-style market chart using actual KRW prices on the y-axis.
+
+    Notes
+    -----
+    - The current database stores snapshot trade prices, not full OHLC candles.
+    - Therefore this view uses a zoomed actual-price line chart with MA overlays
+      and Bollinger band shading instead of a true candlestick chart.
+    - If ALL_NORMALIZED is selected, the selected asset is used automatically.
+    """
+    st.subheader("Actual Market Price Trend")
+
+    if market_history_df.empty or "trade_price" not in market_history_df.columns:
+        st.info("No historical market price data available yet.")
+        return
+
+    target_market = selected_market_view
+    if target_market == "ALL_NORMALIZED":
+        target_market = fallback_asset
+
+    if not target_market:
+        st.info("Select KRW-BTC, KRW-ETH, or KRW-SOL to view the actual raw-price chart.")
+        return
+
+    asset_df = market_history_df.loc[market_history_df["market"] == target_market].copy()
+    asset_df = asset_df.dropna(subset=["trade_price", "collected_at"])
+
+    if asset_df.empty:
+        st.info("No price history available for the selected market.")
+        return
+
+    asset_df = asset_df.sort_values("collected_at").reset_index(drop=True)
+
+    price_columns = ["trade_price", "ma_20", "ma_60", "bollinger_upper_20", "bollinger_lower_20"]
+    available_price_columns = [column for column in price_columns if column in asset_df.columns]
+
+    stacked_values = []
+    for column in available_price_columns:
+        column_values = pd.to_numeric(asset_df[column], errors="coerce").dropna()
+        if not column_values.empty:
+            stacked_values.append(column_values)
+
+    if not stacked_values:
+        st.info("No valid price series available for the selected market.")
+        return
+
+    all_values = pd.concat(stacked_values)
+    price_min = float(all_values.min())
+    price_max = float(all_values.max())
+    if price_min == price_max:
+        padding = max(price_min * 0.01, 1.0)
+    else:
+        padding = max((price_max - price_min) * 0.10, price_max * 0.002)
+
+    y_scale = alt.Scale(domain=[price_min - padding, price_max + padding], zero=False)
+    base = alt.Chart(asset_df).encode(x=alt.X("collected_at:T", title="Timestamp"))
+    layers = []
+
+    if {"bollinger_upper_20", "bollinger_lower_20"}.issubset(asset_df.columns):
+        band_df = asset_df.dropna(subset=["bollinger_upper_20", "bollinger_lower_20"]).copy()
+        if not band_df.empty:
+            band = (
+                alt.Chart(band_df)
+                .mark_area(opacity=0.18)
+                .encode(
+                    x=alt.X("collected_at:T", title="Timestamp"),
+                    y=alt.Y("bollinger_lower_20:Q", title=f"Trade Price ({target_market})", scale=y_scale),
+                    y2="bollinger_upper_20:Q",
+                    tooltip=[
+                        alt.Tooltip("collected_at:T", title="Timestamp"),
+                        alt.Tooltip("bollinger_lower_20:Q", title="Bollinger Lower", format=",.0f"),
+                        alt.Tooltip("bollinger_upper_20:Q", title="Bollinger Upper", format=",.0f"),
+                    ],
+                )
+            )
+            layers.append(band)
+
+    price_line = base.mark_line(point=True, strokeWidth=2.5).encode(
+        y=alt.Y("trade_price:Q", title=f"Trade Price ({target_market})", scale=y_scale),
+        tooltip=[
+            alt.Tooltip("collected_at:T", title="Timestamp"),
+            alt.Tooltip("market:N", title="Asset"),
+            alt.Tooltip("trade_price:Q", title="Trade Price", format=",.0f"),
+            alt.Tooltip("signed_change_rate_pct:Q", title="Signed Change Rate (%)", format=".2f"),
+            alt.Tooltip("rsi_14:Q", title="RSI(14)", format=".2f"),
+        ],
+    )
+    layers.append(price_line)
+
+    if "ma_20" in asset_df.columns and asset_df["ma_20"].notna().any():
+        ma20_line = base.mark_line(strokeDash=[6, 4], strokeWidth=2).encode(
+            y=alt.Y("ma_20:Q", title=f"Trade Price ({target_market})", scale=y_scale),
+            tooltip=[alt.Tooltip("ma_20:Q", title="MA20", format=",.0f")],
+        )
+        layers.append(ma20_line)
+
+    if "ma_60" in asset_df.columns and asset_df["ma_60"].notna().any():
+        ma60_line = base.mark_line(strokeDash=[2, 2], strokeWidth=2).encode(
+            y=alt.Y("ma_60:Q", title=f"Trade Price ({target_market})", scale=y_scale),
+            tooltip=[alt.Tooltip("ma_60:Q", title="MA60", format=",.0f")],
+        )
+        layers.append(ma60_line)
+
+    chart = alt.layer(*layers).properties(height=380)
+
+    st.caption(
+        f"Zoomed actual KRW price view for {target_market}. The y-axis is tightened to the observed price range so short-term movement is visible. "
+        f"True candlesticks require OHLC candle data, which is not yet stored in the current DB schema."
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def render_risk_change_timeseries(risk_history_df: pd.DataFrame) -> None:
+    """
+    Render delta-risk chart to highlight acceleration or stabilization of risk.
+    """
+    st.subheader("Historical Risk Change Trend")
+    if risk_history_df.empty:
+        st.info("No historical risk snapshots available yet.")
+        return
+
+    change_df = risk_history_df.copy()
+    change_df = change_df.sort_values(["asset", "created_at"]).reset_index(drop=True)
+    change_df["risk_change"] = change_df.groupby("asset")["total_risk_score"].diff()
+    change_df = change_df.dropna(subset=["risk_change"])
+
+    if change_df.empty:
+        st.info("Risk change becomes visible after multiple snapshots are accumulated.")
+        return
+
+    chart = (
+        alt.Chart(change_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X("created_at:T", title="Timestamp"),
+            y=alt.Y("risk_change:Q", title="Δ Total Risk Score"),
+            color=alt.Color("asset:N", title="Asset"),
+            tooltip=[
+                alt.Tooltip("created_at:T", title="Timestamp"),
+                alt.Tooltip("asset:N", title="Asset"),
+                alt.Tooltip("risk_change:Q", title="ΔRisk", format=".4f"),
+            ],
+        )
+        .properties(height=320)
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
+
+def render_selected_asset_dual_view(
+    selected_asset: str | None,
+    market_history_df: pd.DataFrame,
+    risk_history_df: pd.DataFrame,
+) -> None:
+    """
+    Render selected asset price and total-risk trend together for interpretability.
+    """
+    st.subheader("Selected Asset Market vs Risk View")
+    if not selected_asset:
+        st.info("Select an asset to inspect its market and risk trajectory.")
+        return
+
+    left_col, right_col = st.columns(2)
+
+    with left_col:
+        st.markdown(f"#### {selected_asset} Price Trend")
+        asset_market = market_history_df.loc[market_history_df.get("market", pd.Series(dtype=str)) == selected_asset].copy()
+        asset_market = asset_market.dropna(subset=["trade_price"]) if not asset_market.empty else asset_market
+        if asset_market.empty:
+            st.info("No historical price data available for the selected asset.")
+        else:
+            price_chart = (
+                alt.Chart(asset_market)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("collected_at:T", title="Timestamp"),
+                    y=alt.Y("trade_price:Q", title="Trade Price"),
+                    tooltip=[
+                        alt.Tooltip("collected_at:T", title="Timestamp"),
+                        alt.Tooltip("trade_price:Q", title="Trade Price", format=",.2f"),
+                    ],
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(price_chart, use_container_width=True)
+
+    with right_col:
+        st.markdown(f"#### {selected_asset} Total Risk Trend")
+        asset_risk = risk_history_df.loc[risk_history_df.get("asset", pd.Series(dtype=str)) == selected_asset].copy()
+        if asset_risk.empty:
+            st.info("No historical total-risk data available for the selected asset.")
+        else:
+            risk_chart = (
+                alt.Chart(asset_risk)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("created_at:T", title="Timestamp"),
+                    y=alt.Y("total_risk_score:Q", title="Total Risk Score", scale=alt.Scale(domain=[0, 1])),
+                    tooltip=[
+                        alt.Tooltip("created_at:T", title="Timestamp"),
+                        alt.Tooltip("total_risk_score:Q", title="Total Risk", format=".4f"),
+                        alt.Tooltip("risk_level:N", title="Risk Level"),
+                    ],
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(risk_chart, use_container_width=True)
+
 
 def render_component_history_chart(risk_history_df: pd.DataFrame, selected_asset: str | None) -> None:
     """
-    Render component risk history for the selected asset.
+    Render component risk history for the selected asset with cleaner legend labels.
     """
     st.subheader("Historical Component Risk Trend")
     if risk_history_df.empty or not selected_asset:
@@ -470,16 +830,24 @@ def render_component_history_chart(risk_history_df: pd.DataFrame, selected_asset
         value_name="score",
     )
 
+    label_map = {
+        "volatility_risk": "Volatility",
+        "liquidity_risk": "Liquidity",
+        "sentiment_risk": "Sentiment",
+        "event_risk": "Event",
+    }
+    long_df["component_label"] = long_df["component"].map(label_map).fillna(long_df["component"])
+
     chart = (
         alt.Chart(long_df)
         .mark_line(point=True)
         .encode(
             x=alt.X("created_at:T", title="Timestamp"),
             y=alt.Y("score:Q", title="Component Score", scale=alt.Scale(domain=[0, 1])),
-            color=alt.Color("component:N", title="Component"),
+            color=alt.Color("component_label:N", title="Component"),
             tooltip=[
                 alt.Tooltip("created_at:T", title="Timestamp"),
-                alt.Tooltip("component:N", title="Component"),
+                alt.Tooltip("component_label:N", title="Component"),
                 alt.Tooltip("score:Q", title="Score", format=".4f"),
             ],
         )
@@ -499,10 +867,30 @@ def render_asset_selector(risk_df: pd.DataFrame) -> str | None:
 
     return st.selectbox("Select Asset", assets, index=0)
 
+def render_overview_market_selector(market_history_df: pd.DataFrame) -> str:
+    """
+    Select which market price view to render in the overview tab.
+    """
+    options = ["ALL_NORMALIZED"]
+    if not market_history_df.empty and "market" in market_history_df.columns:
+        markets = sorted(market_history_df["market"].dropna().astype(str).unique().tolist())
+        options.extend(markets)
+
+    selected_option = st.selectbox(
+        "Overview Market View",
+        options,
+        index=0,
+        help="Choose ALL_NORMALIZED to compare assets on the same base scale, or select one market to inspect its raw price trend.",
+    )
+    return selected_option
 
 def render_asset_summary(selected_asset: str, risk_df: pd.DataFrame, ticker_df: pd.DataFrame, news_df: pd.DataFrame) -> None:
     asset_risk = risk_df.loc[risk_df["asset"] == selected_asset].copy()
-    asset_ticker = ticker_df.loc[ticker_df.get("market", pd.Series(dtype=str)) == selected_asset].copy() if not ticker_df.empty else pd.DataFrame()
+    asset_ticker = (
+        ticker_df.loc[ticker_df.get("market", pd.Series(dtype=str)) == selected_asset].copy()
+        if not ticker_df.empty
+        else pd.DataFrame()
+    )
     asset_news = filter_asset_news(news_df, selected_asset)
 
     if asset_risk.empty:
@@ -641,15 +1029,35 @@ def render_news_section(news_df: pd.DataFrame) -> None:
 
 def main() -> None:
     st.sidebar.title("Controls")
+
+    auto_refresh_enabled = st.sidebar.checkbox(
+        "Auto Refresh",
+        value=True,
+        help="Automatically reload the dashboard to reflect newly ingested DB data.",
+    )
+    auto_refresh_interval = st.sidebar.slider(
+        "Refresh Interval (seconds)",
+        min_value=5,
+        max_value=120,
+        value=15,
+        step=5,
+    )
+
     refresh_requested = st.sidebar.button("Refresh Data")
     if refresh_requested:
         st.cache_data.clear()
+
+    enable_auto_refresh(
+        enabled=auto_refresh_enabled,
+        interval_seconds=auto_refresh_interval,
+    )
 
     dashboard_data = load_dashboard_data()
 
     risk_df = prepare_risk_dataframe(dashboard_data["risk_df"])
     risk_history_df = prepare_risk_history_dataframe(dashboard_data["risk_history_df"])
     ticker_df = prepare_ticker_dataframe(dashboard_data["ticker_df"])
+    market_history_df = prepare_market_history_dataframe(dashboard_data["market_history_df"])
     news_df = prepare_news_dataframe(dashboard_data["news_df"])
 
     render_header(
@@ -657,21 +1065,31 @@ def main() -> None:
         ticker_source=dashboard_data["ticker_source"],
         news_source=dashboard_data["news_source"],
         risk_history_source=dashboard_data["risk_history_source"],
+        market_history_source=dashboard_data["market_history_source"],
     )
     render_alert_banner(risk_df)
-    render_kpis(risk_df)
+    render_kpis(risk_df, risk_history_df)
 
     selected_asset = render_asset_selector(risk_df)
+    overview_market_view = render_overview_market_selector(market_history_df)
 
     overview_tab, asset_tab, news_tab = st.tabs(["Overview", "Asset Drilldown", "News & Table"])
 
     with overview_tab:
+        render_market_price_timeseries(market_history_df)
+        st.divider()
+        render_actual_market_price_chart(market_history_df, overview_market_view, selected_asset)
+        st.divider()
         render_total_risk_timeseries(risk_history_df)
+        st.divider()
+        render_risk_change_timeseries(risk_history_df)
         st.divider()
         render_risk_table(risk_df)
 
     with asset_tab:
         if selected_asset:
+            render_selected_asset_dual_view(selected_asset, market_history_df, risk_history_df)
+            st.divider()
             render_asset_summary(selected_asset, risk_df, ticker_df, news_df)
             st.divider()
             render_component_history_chart(risk_history_df, selected_asset)
