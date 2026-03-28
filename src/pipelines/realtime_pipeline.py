@@ -12,6 +12,7 @@ from src.data.db_repository import (
     get_latest_market_snapshots,
     get_latest_news_articles,
     get_latest_risk_snapshots,
+    save_candle_snapshots,
     save_market_snapshots,
     save_news_articles,
     save_risk_snapshots,
@@ -99,6 +100,7 @@ class RealtimeCryptoRiskPipeline:
         result = self.pipeline.run()
 
         market_snapshot = result.get("market_snapshot", {})
+        candles_df = market_snapshot.get("candles")
         news_df = result.get("news_df")
         risk_evaluation_df = result.get("risk_evaluation_df")
 
@@ -107,8 +109,13 @@ class RealtimeCryptoRiskPipeline:
             save_market_snapshots(
                 db=db,
                 ticker_df=market_snapshot.get("ticker"),
-                candles_df=market_snapshot.get("candles"),
+                candles_df=candles_df,
                 orderbook_df=market_snapshot.get("orderbook"),
+            )
+            save_candle_snapshots(
+                db=db,
+                candles_df=candles_df,
+                interval_type="minute1",
             )
             save_news_articles(db=db, news_df=news_df)
             save_risk_snapshots(db=db, risk_df=risk_evaluation_df)
@@ -116,10 +123,12 @@ class RealtimeCryptoRiskPipeline:
             db.close()
 
         risk_row_count = 0 if risk_evaluation_df is None else len(risk_evaluation_df)
+        candle_row_count = 0 if candles_df is None else len(candles_df)
         logger.info(
-            "Realtime cycle completed successfully. started_at=%s risk_rows=%s",
+            "Realtime cycle completed successfully. started_at=%s risk_rows=%s candle_rows=%s",
             cycle_started_at.isoformat(),
             risk_row_count,
+            candle_row_count,
         )
 
         return result
