@@ -4,8 +4,8 @@ import pandas as pd
 import streamlit as st
 from streamlit import column_config
 
-from src.dashboard.formatters import format_pct, format_price
-from src.llm.risk_explainer import filter_asset_news, generate_hybrid_risk_insight
+from .formatters import format_pct, format_price
+from ..llm.risk_explainer import filter_asset_news, generate_hybrid_risk_insight
 
 
 NEWS_DISPLAY_COLUMNS = ["keyword", "title", "source", "published_at", "open_link"]
